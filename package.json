@@ -1,0 +1,13 @@
+{
+  "name": "mcp-matrix",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.11",
+    "typescript": "^6.0.2"
+  }
+}
