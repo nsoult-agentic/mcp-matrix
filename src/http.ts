@@ -897,8 +897,6 @@ function createServer(): McpServer {
 
 // ── HTTP Server ────────────────────────────────────────────
 
-const mcpServer = createServer();
-
 // ── Startup Sequence ───────────────────────────────────────
 
 async function startup(): Promise<void> {
@@ -966,10 +964,11 @@ startup()
         }
 
         if (url.pathname === "/mcp") {
+          const server = createServer();
           const transport = new WebStandardStreamableHTTPServerTransport({
             sessionIdGenerator: undefined,
           });
-          await mcpServer.connect(transport);
+          await server.connect(transport);
           return transport.handleRequest(req);
         }
 

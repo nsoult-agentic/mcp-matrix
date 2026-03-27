@@ -24,6 +24,6 @@ USER bun
 EXPOSE 8903
 
 # Auto-link ghcr.io package to repo
-LABEL org.opencontainers.image.source=https://github.com/nsoult-agentic/mcp_matrix
+LABEL org.opencontainers.image.source=https://github.com/nsoult-agentic/mcp-matrix
 
 CMD ["bun", "run", "src/http.ts"]

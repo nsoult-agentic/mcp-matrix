@@ -38,7 +38,7 @@ services:
       # Secrets — root-owned on host, read-only in container
       - /srv/mcp-matrix/secrets:/secrets:ro
     tmpfs:
-      - /tmp:size=64m
+      - /tmp:size=64m,noexec,nosuid
 
     # -- Health Check --
     # Startup does login -> logout/all -> re-login -> sync, so allow 30s start
