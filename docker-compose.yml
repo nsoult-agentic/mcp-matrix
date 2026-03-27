@@ -16,6 +16,8 @@ services:
     # -- Network --
     ports:
       - "127.0.0.1:8903:8903"  # Loopback ONLY — no external access
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Access Synapse on host
 
     # -- Security Hardening --
     read_only: true
