@@ -895,6 +895,10 @@ function createServer(): McpServer {
   return server;
 }
 
+// ── Instance ID (for /messages consumer reset detection) ──
+
+const INSTANCE_ID = `mcp-matrix-${Date.now()}`;
+
 // ── Rate Limiter ──────────────────────────────────────────
 
 const RATE_LIMIT = 30;
@@ -909,6 +913,110 @@ function isRateLimited(): boolean {
   if (requestTimestamps.length >= RATE_LIMIT) return true;
   requestTimestamps.push(now);
   return false;
+}
+
+// Separate rate limiter for /messages (60 req/min)
+const MESSAGES_RATE_LIMIT = 60;
+const messagesTimestamps: number[] = [];
+
+function isMessagesRateLimited(): boolean {
+  const now = Date.now();
+  while (messagesTimestamps.length > 0 && messagesTimestamps[0] < now - RATE_WINDOW_MS) {
+    messagesTimestamps.shift();
+  }
+  if (messagesTimestamps.length >= MESSAGES_RATE_LIMIT) return true;
+  messagesTimestamps.push(now);
+  return false;
+}
+
+// ── /messages Endpoint (for channel plugin polling) ───────
+
+function handleMessagesRequest(url: URL): Response {
+  if (isMessagesRateLimited()) {
+    return new Response("Rate limit exceeded", { status: 429 });
+  }
+
+  const sinceId = url.searchParams.get("since") || null;
+  const allowedParam = url.searchParams.get("allowed_senders") || "";
+  const allowedSenders = new Set(
+    allowedParam.split(",").map((s) => s.trim()).filter(Boolean),
+  );
+
+  // Collect messages from all rooms, filter by sender allowlist + self-echo
+  const messages: Array<{
+    event_id: string;
+    sender: string;
+    body: string;
+    room_id: string;
+    timestamp: number;
+  }> = [];
+
+  let foundSince = sinceId === null; // If no since, return all
+  let reset = false;
+
+  // Flatten all rooms into a single chronological list
+  const allMessages: BufferedMessage[] = [];
+  for (const [, buffer] of messageBuffer) {
+    for (const msg of buffer) {
+      allMessages.push(msg);
+    }
+  }
+  allMessages.sort((a, b) => a.timestamp - b.timestamp);
+
+  // Cap to prevent CPU exhaustion on large buffers
+  const MAX_MESSAGES_RESPONSE = 200;
+  if (sinceId === null && allMessages.length > MAX_MESSAGES_RESPONSE) {
+    allMessages.splice(0, allMessages.length - MAX_MESSAGES_RESPONSE);
+  }
+
+  // Check if sinceId exists in buffer
+  if (sinceId !== null) {
+    const sinceExists = allMessages.some((m) => m.eventId === sinceId);
+    if (!sinceExists) {
+      // Stale token (container restarted or buffer wrapped) — return all + reset flag
+      foundSince = true;
+      reset = true;
+    }
+  }
+
+  for (const msg of allMessages) {
+    if (!foundSince) {
+      if (msg.eventId === sinceId) foundSince = true;
+      continue;
+    }
+
+    // Self-echo filter: skip messages from the bot itself
+    if (msg.sender === config.userId) continue;
+
+    // Sender allowlist: only return messages from allowed senders
+    if (allowedSenders.size > 0 && !allowedSenders.has(msg.sender)) continue;
+
+    messages.push({
+      event_id: msg.eventId,
+      sender: msg.sender,
+      body: msg.body,
+      room_id: msg.roomId,
+      timestamp: msg.timestamp,
+    });
+  }
+
+  const lastEventId =
+    messages.length > 0
+      ? messages[messages.length - 1].event_id
+      : sinceId || null;
+
+  return new Response(
+    JSON.stringify({
+      messages,
+      last_event_id: lastEventId,
+      instance_id: INSTANCE_ID,
+      ...(reset ? { reset: true } : {}),
+    }),
+    {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    },
+  );
 }
 
 // ── HTTP Server ────────────────────────────────────────────
@@ -979,6 +1087,10 @@ startup()
           );
         }
 
+        if (url.pathname === "/messages" && req.method === "GET") {
+          return handleMessagesRequest(url);
+        }
+
         if (url.pathname === "/mcp") {
           if (isRateLimited()) {
             return new Response("Rate limit exceeded", { status: 429 });
@@ -997,6 +1109,7 @@ startup()
 
     console.log(`\nmcp-matrix listening on http://0.0.0.0:${PORT}/mcp`);
     console.log(`Tools: 10 | Sync: active | Health: http://0.0.0.0:${PORT}/health`);
+    console.log(`Channel polling: http://0.0.0.0:${PORT}/messages`);
 
     process.on("SIGTERM", () => {
       syncRunning = false;
