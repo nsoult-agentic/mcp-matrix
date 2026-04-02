@@ -231,6 +231,10 @@ let nextBatch: string | null = null;
 let syncRunning = false;
 let syncHealthy = false;
 let syncRetryDelay = 1000;
+let consecutiveSyncFailures = 0;
+let lastSuccessfulSync = 0;
+const UNHEALTHY_AFTER_MS = 5 * 60 * 1000;  // 5 min without successful sync → unhealthy
+const EXIT_AFTER_MS = 30 * 60 * 1000;       // 30 min without successful sync → process.exit(1)
 
 function trackEvent(eventId: string): void {
   processedEvents.add(eventId);
@@ -291,7 +295,7 @@ async function initialSync(): Promise<void> {
 
 async function syncLoop(): Promise<void> {
   syncRunning = true;
-  syncHealthy = true;
+  // syncHealthy stays false until first successful sync
 
   while (syncRunning) {
     // Circuit breaker: stop looping if auth is permanently broken
@@ -337,7 +341,9 @@ async function syncLoop(): Promise<void> {
       }
 
       if (!res.ok) {
-        console.warn(`Sync error: HTTP ${res.status}`);
+        consecutiveSyncFailures++;
+        console.warn(`Sync error: HTTP ${res.status} (failure #${consecutiveSyncFailures})`);
+        checkSyncDegradation();
         await retryWait();
         continue;
       }
@@ -346,6 +352,8 @@ async function syncLoop(): Promise<void> {
       nextBatch = data.next_batch as string;
       syncRetryDelay = 1000;
       syncHealthy = true;
+      consecutiveSyncFailures = 0;
+      lastSuccessfulSync = Date.now();
 
       // Process messages from all joined rooms
       const rooms = data.rooms as Record<string, unknown> | undefined;
@@ -373,18 +381,38 @@ async function syncLoop(): Promise<void> {
       }
     } catch (err) {
       if (!syncRunning) break;
-      const msg = err instanceof Error ? err.message : "Unknown";
-      if (msg.includes("abort") || msg.includes("AbortError")) {
+      const errName = err instanceof Error ? err.name : "Unknown";
+      const errCode = (err as NodeJS.ErrnoException)?.code || errName;
+      if (errName === "AbortError" || errCode === "ABORT_ERR") {
         if (!syncRunning) break;
       }
-      console.warn(`Sync loop error: ${msg}, retrying in ${syncRetryDelay}ms`);
+      consecutiveSyncFailures++;
+      console.warn(`Sync loop error: ${errCode}, retrying in ${syncRetryDelay}ms (failure #${consecutiveSyncFailures})`);
+      checkSyncDegradation();
       await retryWait();
     }
   }
 }
 
+function checkSyncDegradation(): void {
+  if (lastSuccessfulSync === 0) return; // Haven't had first success yet — startup grace
+  const sinceLast = Date.now() - lastSuccessfulSync;
+
+  if (sinceLast > UNHEALTHY_AFTER_MS) {
+    syncHealthy = false;
+  }
+
+  if (sinceLast > EXIT_AFTER_MS) {
+    console.error(
+      `FATAL: No successful sync for ${Math.round(sinceLast / 60000)} minutes. Exiting for Docker restart.`,
+    );
+    process.exit(1);
+  }
+}
+
 async function retryWait(): Promise<void> {
-  await new Promise((r) => setTimeout(r, syncRetryDelay));
+  const jitter = 1 + Math.random() * 0.3; // 0-30% jitter to prevent thundering herd
+  await new Promise((r) => setTimeout(r, syncRetryDelay * jitter));
   syncRetryDelay = Math.min(syncRetryDelay * 2, 30_000);
 }
 
