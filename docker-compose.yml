@@ -9,7 +9,7 @@
 
 services:
   mcp-matrix:
-    image: ghcr.io/nsoult-agentic/mcp-matrix:sha-1d22da8
+    image: ghcr.io/nsoult-agentic/mcp-matrix:sha-06088cc
     container_name: mcp-matrix
     restart: unless-stopped
 
