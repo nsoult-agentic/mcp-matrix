@@ -222,6 +222,14 @@ interface BufferedMessage {
   body: string;
   timestamp: number;
   roomId: string;
+  msgtype?: string;
+  imageUrl?: string;
+  imageInfo?: {
+    mimetype?: string;
+    size?: number;
+    w?: number;
+    h?: number;
+  };
 }
 
 const MAX_ROOMS = 200;
@@ -369,6 +377,8 @@ async function syncLoop(): Promise<void> {
           if (!content?.body) continue;
           if (processedEvents.has(event.event_id as string)) continue;
 
+          const msgtype = (content.msgtype as string) || "m.text";
+
           trackEvent(event.event_id as string);
           bufferMessage({
             eventId: event.event_id as string,
@@ -376,6 +386,20 @@ async function syncLoop(): Promise<void> {
             body: content.body as string,
             timestamp: event.origin_server_ts as number,
             roomId,
+            msgtype,
+            ...(msgtype === "m.image" && content.url
+              ? {
+                  imageUrl: content.url as string,
+                  imageInfo: content.info
+                    ? {
+                        mimetype: (content.info as Record<string, unknown>).mimetype as string | undefined,
+                        size: (content.info as Record<string, unknown>).size as number | undefined,
+                        w: (content.info as Record<string, unknown>).w as number | undefined,
+                        h: (content.info as Record<string, unknown>).h as number | undefined,
+                      }
+                    : undefined,
+                }
+              : {}),
           });
         }
       }
@@ -957,6 +981,20 @@ function isMessagesRateLimited(): boolean {
   return false;
 }
 
+// Separate rate limiter for /media (10 req/min)
+const MEDIA_RATE_LIMIT = 10;
+const mediaTimestamps: number[] = [];
+
+function isMediaRateLimited(): boolean {
+  const now = Date.now();
+  while (mediaTimestamps.length > 0 && mediaTimestamps[0] < now - RATE_WINDOW_MS) {
+    mediaTimestamps.shift();
+  }
+  if (mediaTimestamps.length >= MEDIA_RATE_LIMIT) return true;
+  mediaTimestamps.push(now);
+  return false;
+}
+
 // ── /messages Endpoint (for channel plugin polling) ───────
 
 function handleMessagesRequest(url: URL): Response {
@@ -977,6 +1015,9 @@ function handleMessagesRequest(url: URL): Response {
     body: string;
     room_id: string;
     timestamp: number;
+    msgtype?: string;
+    image_url?: string;
+    image_info?: { mimetype?: string; size?: number; w?: number; h?: number };
   }> = [];
 
   let foundSince = sinceId === null; // If no since, return all
@@ -1025,6 +1066,9 @@ function handleMessagesRequest(url: URL): Response {
       body: msg.body,
       room_id: msg.roomId,
       timestamp: msg.timestamp,
+      ...(msg.msgtype && msg.msgtype !== "m.text" ? { msgtype: msg.msgtype } : {}),
+      ...(msg.imageUrl ? { image_url: msg.imageUrl } : {}),
+      ...(msg.imageInfo ? { image_info: msg.imageInfo } : {}),
     });
   }
 
@@ -1117,6 +1161,71 @@ startup()
 
         if (url.pathname === "/messages" && req.method === "GET") {
           return handleMessagesRequest(url);
+        }
+
+        // ── /media proxy (authenticated Matrix media download) ──
+        if (url.pathname.startsWith("/media/") && req.method === "GET") {
+          if (isMediaRateLimited()) {
+            return new Response("Rate limit exceeded", { status: 429 });
+          }
+
+          const pathAfter = url.pathname.slice("/media/".length);
+          const slashIdx = pathAfter.indexOf("/");
+          if (slashIdx < 1) {
+            return new Response("Bad path: /media/{serverName}/{mediaId}", { status: 400 });
+          }
+          const serverName = pathAfter.slice(0, slashIdx);
+          const mediaId = pathAfter.slice(slashIdx + 1);
+
+          if (!serverName || !mediaId) {
+            return new Response("Bad path: /media/{serverName}/{mediaId}", { status: 400 });
+          }
+
+          // SSRF: only allow media from our homeserver domain
+          const homeserverHost = new URL(config.homeserver).hostname;
+          if (serverName !== homeserverHost) {
+            return new Response(`Forbidden: serverName must be ${homeserverHost}`, { status: 403 });
+          }
+
+          // Path traversal protection
+          if (mediaId.includes("..") || mediaId.includes("/") || mediaId.includes("\\")) {
+            return new Response("Bad mediaId: path traversal rejected", { status: 400 });
+          }
+
+          try {
+            const mediaRes = await fetch(
+              `${config.homeserver}/_matrix/media/v3/download/${encodeURIComponent(serverName)}/${encodeURIComponent(mediaId)}`,
+              {
+                headers: { Authorization: `Bearer ${accessToken}` },
+                signal: AbortSignal.timeout(30_000),
+              },
+            );
+
+            if (!mediaRes.ok) {
+              return new Response(`Media download failed: ${mediaRes.status}`, { status: mediaRes.status });
+            }
+
+            // Content-Type validation: only serve images
+            const contentType = mediaRes.headers.get("Content-Type") || "";
+            if (!contentType.startsWith("image/")) {
+              return new Response(`Unsupported Content-Type: ${contentType} (only image/* allowed)`, { status: 415 });
+            }
+
+            return new Response(mediaRes.body, {
+              status: 200,
+              headers: {
+                "Content-Type": contentType,
+                ...(mediaRes.headers.get("Content-Length")
+                  ? { "Content-Length": mediaRes.headers.get("Content-Length")! }
+                  : {}),
+              },
+            });
+          } catch (err) {
+            return new Response(
+              `Media proxy error: ${err instanceof Error ? err.message : "unknown"}`,
+              { status: 502 },
+            );
+          }
         }
 
         if (url.pathname === "/mcp") {
