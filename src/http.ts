@@ -1194,7 +1194,7 @@ startup()
 
           try {
             const mediaRes = await fetch(
-              `${config.homeserver}/_matrix/media/v3/download/${encodeURIComponent(serverName)}/${encodeURIComponent(mediaId)}`,
+              `${config.homeserver}/_matrix/client/v1/media/download/${encodeURIComponent(serverName)}/${encodeURIComponent(mediaId)}`,
               {
                 headers: { Authorization: `Bearer ${accessToken}` },
                 signal: AbortSignal.timeout(30_000),
