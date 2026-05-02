@@ -245,7 +245,7 @@ let syncRetryDelay = 1000;
 let consecutiveSyncFailures = 0;
 let lastSuccessfulSync = 0;
 const UNHEALTHY_AFTER_MS = 5 * 60 * 1000;  // 5 min without successful sync → unhealthy
-const EXIT_AFTER_MS = 30 * 60 * 1000;       // 30 min without successful sync → process.exit(1)
+const LOG_DEGRADED_INTERVAL_MS = 30 * 60 * 1000; // Log degradation every 30 min (no exit)
 
 function trackEvent(eventId: string): void {
   processedEvents.add(eventId);
@@ -442,11 +442,16 @@ function checkSyncDegradation(): void {
     syncHealthy = false;
   }
 
-  if (sinceLast > EXIT_AFTER_MS) {
-    console.error(
-      `FATAL: No successful sync for ${Math.round(sinceLast / 60000)} minutes. Exiting for Docker restart.`,
-    );
-    process.exit(1);
+  // Log periodic degradation warnings but do NOT exit — keep retrying.
+  // External health monitoring (pai-health.timer) handles container restart if needed.
+  if (sinceLast > LOG_DEGRADED_INTERVAL_MS) {
+    const mins = Math.round(sinceLast / 60000);
+    // Log every 30 minutes to avoid flooding
+    if (mins % 30 === 0 || consecutiveSyncFailures <= 5) {
+      console.error(
+        `DEGRADED: No successful sync for ${mins} minutes (${consecutiveSyncFailures} failures). Retrying...`,
+      );
+    }
   }
 }
 
