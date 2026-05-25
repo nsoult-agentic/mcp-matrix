@@ -55,3 +55,43 @@ services:
       - SECRETS_DIR=/secrets
       - PORT=8903
       # NEVER put credentials here — read from /secrets/config.json
+
+  # ── SENY bot instance (@seny:matrix.stabpablo.eu, separate port) ──
+  mcp-matrix-seny:
+    image: ghcr.io/nsoult-agentic/mcp-matrix:sha-e8a1ab0
+    container_name: mcp-matrix-seny
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:8917:8903"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+
+    volumes:
+      - /srv/mcp-matrix-seny/secrets:/secrets:ro
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid
+
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8903/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    environment:
+      - NODE_ENV=production
+      - SECRETS_DIR=/secrets
+      - PORT=8903
