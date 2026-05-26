@@ -698,7 +698,7 @@ function readMessagesJson(roomId: string, limit: number, sinceEventId?: string):
   }
 
   const remaining = buffer.slice(startIdx);
-  const messages = remaining.slice(-limit);
+  const messages = remaining.slice(0, limit); // Oldest first — poller advances checkpoint
 
   return JSON.stringify({
     messages: messages.map((msg) => ({
