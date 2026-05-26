@@ -682,6 +682,40 @@ function readMessages(roomId: string, limit: number): string {
   return lines.join("\n");
 }
 
+function readMessagesJson(roomId: string, limit: number, sinceEventId?: string): string {
+  const buffer = messageBuffer.get(roomId);
+  if (!buffer || buffer.length === 0) {
+    return JSON.stringify({ messages: [], buffer_size: 0 });
+  }
+
+  // If sinceEventId provided, skip up to and including that event
+  let startIdx = 0;
+  if (sinceEventId) {
+    const sinceIdx = buffer.findIndex((m) => m.eventId === sinceEventId);
+    if (sinceIdx >= 0) {
+      startIdx = sinceIdx + 1;
+    }
+  }
+
+  const remaining = buffer.slice(startIdx);
+  const messages = remaining.slice(-limit);
+
+  return JSON.stringify({
+    messages: messages.map((msg) => ({
+      event_id: msg.eventId,
+      sender: msg.sender,
+      body: sanitizeBody(msg.body),
+      timestamp: msg.timestamp,
+      room_id: msg.roomId,
+      ...(msg.msgtype && msg.msgtype !== "m.text" ? { msgtype: msg.msgtype } : {}),
+      ...(msg.replyToEventId ? { reply_to_event_id: msg.replyToEventId } : {}),
+      ...(msg.imageUrl ? { image_url: msg.imageUrl } : {}),
+      ...(msg.imageInfo ? { image_info: msg.imageInfo } : {}),
+    })),
+    buffer_size: buffer.length,
+  });
+}
+
 // ── MCP Server ─────────────────────────────────────────────
 
 function createServer(): McpServer {
@@ -742,9 +776,22 @@ function createServer(): McpServer {
         .max(50)
         .default(20)
         .describe("Number of messages to return (default: 20)"),
+      format: z
+        .enum(["text", "json"])
+        .default("text")
+        .describe("Output format: 'text' for human-readable, 'json' for structured data with event_id, sender, body, timestamp, room_id"),
+      sinceEventId: z
+        .string()
+        .optional()
+        .describe("Only return messages after this event ID (exclusive). Used for polling."),
     },
     async (params) => {
       const room = params.roomId || config.defaultRoomId;
+      if (params.format === "json") {
+        return {
+          content: [{ type: "text" as const, text: readMessagesJson(room, params.limit, params.sinceEventId) }],
+        };
+      }
       return {
         content: [{ type: "text" as const, text: readMessages(room, params.limit) }],
       };
