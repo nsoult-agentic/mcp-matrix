@@ -734,6 +734,10 @@ function createServer(): McpServer {
         .enum(["text", "markdown"])
         .default("text")
         .describe("Message format"),
+      responseFormat: z
+        .enum(["text", "json"])
+        .default("text")
+        .describe("Return format: 'text' for a human-readable confirmation, 'json' for structured {event_id, room_id} (use for programmatic callers that need the event_id)"),
       replyTo: z
         .string()
         .optional()
@@ -743,17 +747,32 @@ function createServer(): McpServer {
       try {
         const room = params.roomId || config.defaultRoomId;
         const eventId = await sendMessage(room, params.message, params.format, params.replyTo);
+        if (params.responseFormat === "json") {
+          return {
+            content: [
+              { type: "text" as const, text: JSON.stringify({ event_id: eventId, room_id: room }) },
+            ],
+          };
+        }
         return {
           content: [
             { type: "text" as const, text: `Message sent to ${room} (${eventId})` },
           ],
         };
       } catch (err) {
+        const errMsg = err instanceof Error ? err.message : "Unknown error";
+        if (params.responseFormat === "json") {
+          return {
+            content: [
+              { type: "text" as const, text: JSON.stringify({ error: errMsg }) },
+            ],
+          };
+        }
         return {
           content: [
             {
               type: "text" as const,
-              text: `Send failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+              text: `Send failed: ${errMsg}`,
             },
           ],
         };
