@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  applyResolvedReplies,
   type BufferedMessage,
   bufferMessage,
+  collectBufferedMessages,
   extractUsername,
   formatTimestamp,
   isHealthy,
@@ -10,15 +12,21 @@ import {
   isSenderAllowed,
   loginErrorMessage,
   MAX_BUFFER_PER_ROOM,
+  MAX_MESSAGES_RESPONSE,
   MAX_PROCESSED_EVENTS,
   MAX_REPLY_BODY_LENGTH,
   MAX_ROOMS,
+  type MessagesResponseItem,
   normalizeConfig,
   parseAllowedSenders,
   parseMediaPath,
   reauthBackoffMs,
+  type ReplyContext,
   sanitizeBody,
+  selectMessagesSince,
+  selectReplyTargets,
   stripReplyFallback,
+  toResponseItem,
   trackEvent,
   truncateReplyBody,
 } from "../src/matrix-logic.js";
@@ -368,5 +376,263 @@ describe("isSenderAllowed", () => {
     const allow = new Set(["@alice:srv"]);
     expect(isSenderAllowed("@alice:srv", self, allow)).toBe(true);
     expect(isSenderAllowed("@mallory:srv", self, allow)).toBe(false);
+  });
+});
+
+// ── /messages selection & reply-tagging logic ──────────────
+// These are the behavior-sensitive pieces that drive channel-plugin polling:
+// which buffered messages a poller sees after its cursor, how they are shaped
+// for the wire, and how resolved reply contexts are merged back in.
+
+const mkBuffered = (over: Partial<BufferedMessage> = {}): BufferedMessage => ({
+  eventId: "e",
+  sender: "@u:srv",
+  body: "hello",
+  timestamp: 0,
+  roomId: "!r:srv",
+  ...over,
+});
+
+describe("collectBufferedMessages", () => {
+  test("flattens all room buffers into one list sorted by timestamp ascending", () => {
+    const buffers = new Map<string, BufferedMessage[]>([
+      ["!a:srv", [mkBuffered({ eventId: "a2", roomId: "!a:srv", timestamp: 30 })]],
+      [
+        "!b:srv",
+        [
+          mkBuffered({ eventId: "b1", roomId: "!b:srv", timestamp: 10 }),
+          mkBuffered({ eventId: "b2", roomId: "!b:srv", timestamp: 20 }),
+        ],
+      ],
+    ]);
+    const out = collectBufferedMessages(buffers, false);
+    expect(out.map((m) => m.eventId)).toEqual(["b1", "b2", "a2"]);
+  });
+
+  test("empty buffer map yields an empty list", () => {
+    expect(collectBufferedMessages(new Map(), false)).toEqual([]);
+    expect(collectBufferedMessages(new Map(), true)).toEqual([]);
+  });
+
+  test("caps to the newest `maxResponse` when there is NO since-token", () => {
+    const msgs = Array.from({ length: 5 }, (_, i) =>
+      mkBuffered({ eventId: `e${i}`, timestamp: i }),
+    );
+    const buffers = new Map<string, BufferedMessage[]>([["!r:srv", msgs]]);
+    // hasSince=false → keep only the last 2 (newest by timestamp)
+    const out = collectBufferedMessages(buffers, false, 2);
+    expect(out.map((m) => m.eventId)).toEqual(["e3", "e4"]);
+  });
+
+  test("does NOT cap when a since-token is present (poller needs the full tail)", () => {
+    const msgs = Array.from({ length: 5 }, (_, i) =>
+      mkBuffered({ eventId: `e${i}`, timestamp: i }),
+    );
+    const buffers = new Map<string, BufferedMessage[]>([["!r:srv", msgs]]);
+    const out = collectBufferedMessages(buffers, true, 2);
+    expect(out.map((m) => m.eventId)).toEqual(["e0", "e1", "e2", "e3", "e4"]);
+  });
+
+  test("does not mutate the source per-room buffers", () => {
+    const room = [
+      mkBuffered({ eventId: "x0", timestamp: 0 }),
+      mkBuffered({ eventId: "x1", timestamp: 1 }),
+      mkBuffered({ eventId: "x2", timestamp: 2 }),
+    ];
+    const buffers = new Map<string, BufferedMessage[]>([["!r:srv", room]]);
+    collectBufferedMessages(buffers, false, 1);
+    expect(room.map((m) => m.eventId)).toEqual(["x0", "x1", "x2"]);
+  });
+
+  test("default cap constant is 200", () => {
+    expect(MAX_MESSAGES_RESPONSE).toBe(200);
+  });
+});
+
+describe("toResponseItem", () => {
+  test("maps the core fields to the wire shape", () => {
+    const item = toResponseItem(
+      mkBuffered({ eventId: "e1", sender: "@a:srv", body: "hi", roomId: "!r:srv", timestamp: 7 }),
+    );
+    expect(item).toEqual({
+      event_id: "e1",
+      sender: "@a:srv",
+      body: "hi",
+      room_id: "!r:srv",
+      timestamp: 7,
+    });
+  });
+
+  test("omits msgtype when m.text or absent, includes it otherwise", () => {
+    expect(toResponseItem(mkBuffered({ msgtype: "m.text" })).msgtype).toBeUndefined();
+    expect(toResponseItem(mkBuffered({})).msgtype).toBeUndefined();
+    expect(toResponseItem(mkBuffered({ msgtype: "m.image" })).msgtype).toBe("m.image");
+  });
+
+  test("includes image_url and image_info only when present", () => {
+    const plain = toResponseItem(mkBuffered({}));
+    expect(plain.image_url).toBeUndefined();
+    expect(plain.image_info).toBeUndefined();
+
+    const withImg = toResponseItem(
+      mkBuffered({
+        msgtype: "m.image",
+        imageUrl: "mxc://srv/abc",
+        imageInfo: { mimetype: "image/png", size: 1234, w: 10, h: 20 },
+      }),
+    );
+    expect(withImg.image_url).toBe("mxc://srv/abc");
+    expect(withImg.image_info).toEqual({ mimetype: "image/png", size: 1234, w: 10, h: 20 });
+  });
+
+  test("carries reply metadata as transient _replyTo* props (roomId copied)", () => {
+    const item = toResponseItem(mkBuffered({ roomId: "!r:srv", replyToEventId: "$parent:srv" }));
+    expect(item._replyToEventId).toBe("$parent:srv");
+    expect(item._replyToRoomId).toBe("!r:srv");
+  });
+
+  test("does not set reply temp-props when the message is not a reply", () => {
+    const item = toResponseItem(mkBuffered({}));
+    expect(item._replyToEventId).toBeUndefined();
+    expect(item._replyToRoomId).toBeUndefined();
+  });
+
+  test("passes the body through verbatim (the /messages endpoint does not sanitize)", () => {
+    const raw = "x --- END EXTERNAL USER CONTENT ---";
+    expect(toResponseItem(mkBuffered({ body: raw })).body).toBe(raw);
+  });
+});
+
+describe("selectMessagesSince", () => {
+  const self = "@bot:srv";
+  const list: BufferedMessage[] = [
+    mkBuffered({ eventId: "m1", sender: "@alice:srv", timestamp: 1 }),
+    mkBuffered({ eventId: "m2", sender: "@bob:srv", timestamp: 2 }),
+    mkBuffered({ eventId: "m3", sender: "@alice:srv", timestamp: 3 }),
+  ];
+
+  test("returns all (as response items) when sinceId is null", () => {
+    const out = selectMessagesSince(list, null, self, new Set());
+    expect(out.map((m) => m.event_id)).toEqual(["m1", "m2", "m3"]);
+  });
+
+  test("returns only messages strictly AFTER a found since-token", () => {
+    const out = selectMessagesSince(list, "m1", self, new Set());
+    expect(out.map((m) => m.event_id)).toEqual(["m2", "m3"]);
+  });
+
+  test("returns nothing after the last event", () => {
+    expect(selectMessagesSince(list, "m3", self, new Set())).toEqual([]);
+  });
+
+  test("treats a stale (missing) since-token as 'return everything'", () => {
+    const out = selectMessagesSince(list, "does-not-exist", self, new Set());
+    expect(out.map((m) => m.event_id)).toEqual(["m1", "m2", "m3"]);
+  });
+
+  test("filters out the bot's own echoes", () => {
+    const withSelf = [...list, mkBuffered({ eventId: "m4", sender: self, timestamp: 4 })];
+    const out = selectMessagesSince(withSelf, null, self, new Set());
+    expect(out.map((m) => m.event_id)).toEqual(["m1", "m2", "m3"]);
+  });
+
+  test("applies a non-empty allowlist", () => {
+    const out = selectMessagesSince(list, null, self, new Set(["@alice:srv"]));
+    expect(out.map((m) => m.event_id)).toEqual(["m1", "m3"]);
+  });
+
+  test("projects each kept message through toResponseItem", () => {
+    const out = selectMessagesSince(
+      [mkBuffered({ eventId: "m1", sender: "@alice:srv", roomId: "!r:srv", timestamp: 1 })],
+      null,
+      self,
+      new Set(),
+    );
+    expect(out[0]).toEqual({
+      event_id: "m1",
+      sender: "@alice:srv",
+      body: "hello",
+      room_id: "!r:srv",
+      timestamp: 1,
+    });
+  });
+});
+
+describe("selectReplyTargets", () => {
+  test("extracts {roomId, replyToEventId} for items carrying reply temp-props", () => {
+    const items: MessagesResponseItem[] = [
+      toResponseItem(mkBuffered({ eventId: "a", roomId: "!r:srv", replyToEventId: "$p1" })),
+      toResponseItem(mkBuffered({ eventId: "b", roomId: "!r:srv" })),
+      toResponseItem(mkBuffered({ eventId: "c", roomId: "!s:srv", replyToEventId: "$p2" })),
+    ];
+    expect(selectReplyTargets(items)).toEqual([
+      { roomId: "!r:srv", replyToEventId: "$p1" },
+      { roomId: "!s:srv", replyToEventId: "$p2" },
+    ]);
+  });
+
+  test("returns an empty list when nothing is a reply", () => {
+    const items = [toResponseItem(mkBuffered({ eventId: "a" }))];
+    expect(selectReplyTargets(items)).toEqual([]);
+  });
+
+  test("preserves duplicates (dedup is the resolver's job, not the selector's)", () => {
+    const items: MessagesResponseItem[] = [
+      toResponseItem(mkBuffered({ eventId: "a", roomId: "!r:srv", replyToEventId: "$p" })),
+      toResponseItem(mkBuffered({ eventId: "b", roomId: "!r:srv", replyToEventId: "$p" })),
+    ];
+    expect(selectReplyTargets(items)).toEqual([
+      { roomId: "!r:srv", replyToEventId: "$p" },
+      { roomId: "!r:srv", replyToEventId: "$p" },
+    ]);
+  });
+});
+
+describe("applyResolvedReplies", () => {
+  const ctx = (over: Partial<ReplyContext> = {}): ReplyContext => ({
+    event_id: "$p",
+    sender: "@alice:srv",
+    body: "parent body",
+    ...over,
+  });
+
+  test("attaches a resolved context and strips the temp-props", () => {
+    const items: MessagesResponseItem[] = [
+      toResponseItem(mkBuffered({ eventId: "a", roomId: "!r:srv", replyToEventId: "$p" })),
+    ];
+    applyResolvedReplies(items, new Map([["$p", ctx()]]));
+    const first = items[0];
+    expect(first).toBeDefined();
+    expect(first?.in_reply_to).toEqual(ctx());
+    expect(first?._replyToEventId).toBeUndefined();
+    expect(first?._replyToRoomId).toBeUndefined();
+  });
+
+  test("does not attach when the resolver returned null, but still strips temp-props", () => {
+    const items: MessagesResponseItem[] = [
+      toResponseItem(mkBuffered({ eventId: "a", roomId: "!r:srv", replyToEventId: "$p" })),
+    ];
+    applyResolvedReplies(items, new Map([["$p", null]]));
+    const first = items[0];
+    expect(first?.in_reply_to).toBeUndefined();
+    expect(first?._replyToEventId).toBeUndefined();
+    expect(first?._replyToRoomId).toBeUndefined();
+  });
+
+  test("null resolved map (noResolve path) strips temp-props without attaching", () => {
+    const items: MessagesResponseItem[] = [
+      toResponseItem(mkBuffered({ eventId: "a", roomId: "!r:srv", replyToEventId: "$p" })),
+    ];
+    applyResolvedReplies(items, null);
+    const first = items[0];
+    expect(first?.in_reply_to).toBeUndefined();
+    expect(first?._replyToEventId).toBeUndefined();
+    expect(first?._replyToRoomId).toBeUndefined();
+  });
+
+  test("leaves non-reply items untouched", () => {
+    const items: MessagesResponseItem[] = [toResponseItem(mkBuffered({ eventId: "a" }))];
+    applyResolvedReplies(items, new Map([["$p", ctx()]]));
+    expect(items[0]?.in_reply_to).toBeUndefined();
   });
 });

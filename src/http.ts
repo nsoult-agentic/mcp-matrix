@@ -39,19 +39,25 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
 import {
+  applyResolvedReplies,
+  type BufferedMessage,
   bufferMessage as bufferMessagePure,
+  collectBufferedMessages,
   extractUsername,
   formatTimestamp,
   isHealthy,
   isRateLimited as isRateLimitedPure,
-  isSenderAllowed,
   loginErrorMessage,
   type MatrixConfig,
+  type MessagesResponseItem,
   normalizeConfig,
   parseAllowedSenders,
   parseMediaPath,
   reauthBackoffMs,
+  type ReplyContext,
   sanitizeBody,
+  selectMessagesSince,
+  selectReplyTargets,
   stripReplyFallback,
   trackEvent as trackEventPure,
   truncateReplyBody,
@@ -208,23 +214,6 @@ async function matrixFetch(path: string, init: RequestInit = {}): Promise<Respon
 }
 
 // ── Sync Loop & Message Buffer ─────────────────────────────
-
-interface BufferedMessage {
-  eventId: string;
-  sender: string;
-  body: string;
-  timestamp: number;
-  roomId: string;
-  msgtype?: string;
-  imageUrl?: string;
-  imageInfo?: {
-    mimetype?: string;
-    size?: number;
-    w?: number;
-    h?: number;
-  };
-  replyToEventId?: string;
-}
 
 /** Build the optional imageInfo shape from a raw Matrix m.image `info` object,
  *  including only the fields that are present. */
@@ -1218,12 +1207,6 @@ function isMediaRateLimited(): boolean {
 
 // ── Reply Context Resolution ─────────────────────────────
 
-interface ReplyContext {
-  event_id: string;
-  sender: string;
-  body: string;
-}
-
 async function resolveReplyContext(roomId: string, eventId: string): Promise<ReplyContext | null> {
   // Fast path: look up in the in-memory buffer
   const buffer = messageBuffer.get(roomId);
@@ -1308,108 +1291,20 @@ async function resolveRepliesBatch(
 
 // ── /messages Endpoint (for channel plugin polling) ───────
 
-interface MessagesResponseItem {
-  event_id: string;
-  sender: string;
-  body: string;
-  room_id: string;
-  timestamp: number;
-  msgtype?: string;
-  image_url?: string;
-  image_info?: { mimetype?: string; size?: number; w?: number; h?: number };
-  in_reply_to?: ReplyContext;
-  // Transient props used only to carry reply metadata between phases; stripped
-  // (via delete) before the response is serialized.
-  _replyToEventId?: string;
-  _replyToRoomId?: string;
-}
-
-const MAX_MESSAGES_RESPONSE = 200;
-
-/** Flatten all room buffers into one chronological list, capped when no since-token. */
-function collectBufferedMessages(hasSince: boolean): BufferedMessage[] {
-  const allMessages: BufferedMessage[] = [];
-  for (const [, buffer] of messageBuffer) {
-    for (const msg of buffer) {
-      allMessages.push(msg);
-    }
-  }
-  allMessages.sort((a, b) => a.timestamp - b.timestamp);
-
-  // Cap to prevent CPU exhaustion on large buffers
-  if (!hasSince && allMessages.length > MAX_MESSAGES_RESPONSE) {
-    allMessages.splice(0, allMessages.length - MAX_MESSAGES_RESPONSE);
-  }
-  return allMessages;
-}
-
-/** Project a buffered message into the wire shape, tagging reply temp-props. */
-function toResponseItem(msg: BufferedMessage): MessagesResponseItem {
-  return {
-    event_id: msg.eventId,
-    sender: msg.sender,
-    body: msg.body,
-    room_id: msg.roomId,
-    timestamp: msg.timestamp,
-    ...(msg.msgtype && msg.msgtype !== "m.text" ? { msgtype: msg.msgtype } : {}),
-    ...(msg.imageUrl ? { image_url: msg.imageUrl } : {}),
-    ...(msg.imageInfo ? { image_info: msg.imageInfo } : {}),
-    ...(msg.replyToEventId
-      ? { _replyToEventId: msg.replyToEventId, _replyToRoomId: msg.roomId }
-      : {}),
-  };
-}
-
-/** Select messages after the since-token, applying self-echo + allowlist filters. */
-function selectMessagesSince(
-  allMessages: BufferedMessage[],
-  sinceId: string | null,
-  allowedSenders: Set<string>,
-): MessagesResponseItem[] {
-  // Stale token (container restarted or buffer wrapped) — return all.
-  const sinceMissing = sinceId !== null && !allMessages.some((m) => m.eventId === sinceId);
-  let foundSince = sinceId === null || sinceMissing;
-
-  const messages: MessagesResponseItem[] = [];
-  for (const msg of allMessages) {
-    if (!foundSince) {
-      if (msg.eventId === sinceId) foundSince = true;
-      continue;
-    }
-    // Self-echo filter + sender allowlist
-    if (!isSenderAllowed(msg.sender, config.userId, allowedSenders)) continue;
-    messages.push(toResponseItem(msg));
-  }
-  return messages;
-}
-
-/** Resolve reply contexts in place (parallel, time-budgeted) then strip temp-props. */
+/**
+ * Resolve reply contexts (parallel, time-budgeted) and merge them in place,
+ * then strip the transient reply temp-props. Pure selection/merge logic lives
+ * in matrix-logic; this wrapper only owns the I/O (resolveRepliesBatch).
+ */
 async function attachReplyContexts(
   messages: MessagesResponseItem[],
   noResolve: boolean,
 ): Promise<void> {
+  let resolved: Map<string, ReplyContext | null> | null = null;
   if (!noResolve) {
-    const replyMsgs = messages
-      .filter(
-        (m): m is MessagesResponseItem & { _replyToEventId: string; _replyToRoomId: string } =>
-          Boolean(m._replyToEventId),
-      )
-      .map((m) => ({ roomId: m._replyToRoomId, replyToEventId: m._replyToEventId }));
-    const resolved = await resolveRepliesBatch(replyMsgs);
-    for (const m of messages) {
-      const rid = m._replyToEventId;
-      if (rid !== undefined) {
-        const ctx = resolved.get(rid);
-        if (ctx) m.in_reply_to = ctx;
-      }
-    }
+    resolved = await resolveRepliesBatch(selectReplyTargets(messages));
   }
-
-  // Always clean up temp properties (regardless of noResolve)
-  for (const m of messages) {
-    delete m._replyToEventId;
-    delete m._replyToRoomId;
-  }
+  applyResolvedReplies(messages, resolved);
 }
 
 async function handleMessagesRequest(url: URL): Promise<Response> {
@@ -1422,11 +1317,11 @@ async function handleMessagesRequest(url: URL): Promise<Response> {
   const noResolve = url.searchParams.get("no_resolve") === "true";
   const allowedSenders = parseAllowedSenders(allowedParam);
 
-  const allMessages = collectBufferedMessages(sinceId !== null);
+  const allMessages = collectBufferedMessages(messageBuffer, sinceId !== null);
   // Stale token => return all messages and flag a reset to the caller.
   const reset = sinceId !== null && !allMessages.some((m) => m.eventId === sinceId);
 
-  const messages = selectMessagesSince(allMessages, sinceId, allowedSenders);
+  const messages = selectMessagesSince(allMessages, sinceId, config.userId, allowedSenders);
   await attachReplyContexts(messages, noResolve);
 
   const lastMessage = messages[messages.length - 1];
