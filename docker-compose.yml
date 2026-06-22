@@ -9,7 +9,7 @@
 
 services:
   mcp-matrix:
-    image: ghcr.io/nsoult-agentic/mcp-matrix:sha-f1f3c4c
+    image: ghcr.io/nsoult-agentic/mcp-matrix:sha-9c39e65
     container_name: mcp-matrix
     restart: unless-stopped
 
@@ -58,7 +58,7 @@ services:
 
   # ── SENY bot instance (@seny:matrix.stabpablo.eu, separate port) ──
   mcp-matrix-seny:
-    image: ghcr.io/nsoult-agentic/mcp-matrix:sha-f1f3c4c
+    image: ghcr.io/nsoult-agentic/mcp-matrix:sha-9c39e65
     container_name: mcp-matrix-seny
     restart: unless-stopped
 
