@@ -21,17 +21,17 @@
 			"recommended": true,
 			"complexity": {
 				"noExcessiveCognitiveComplexity": {
-					"level": "warn",
+					"level": "error",
 					"options": { "maxAllowedComplexity": 15 }
 				},
 				"useLiteralKeys": "off"
 			},
 			"suspicious": {
-				"noExplicitAny": "warn",
-				"noAssignInExpressions": "warn"
+				"noExplicitAny": "error",
+				"noAssignInExpressions": "error"
 			},
 			"style": {
-				"noNonNullAssertion": "warn"
+				"noNonNullAssertion": "error"
 			}
 		}
 	},
