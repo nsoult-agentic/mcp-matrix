@@ -22,15 +22,20 @@ export interface MatrixConfig {
  * stripped from the homeserver. Throws if any required field is missing/falsy.
  */
 export function normalizeConfig(parsed: Record<string, unknown>): MatrixConfig {
-  if (!parsed.homeserver || !parsed.userId || !parsed.password || !parsed.defaultRoomId) {
+  if (
+    !parsed["homeserver"] ||
+    !parsed["userId"] ||
+    !parsed["password"] ||
+    !parsed["defaultRoomId"]
+  ) {
     throw new Error("config.json must contain: homeserver, userId, password, defaultRoomId");
   }
 
   return {
-    homeserver: (parsed.homeserver as string).replace(/\/+$/, ""),
-    userId: parsed.userId as string,
-    password: parsed.password as string,
-    defaultRoomId: parsed.defaultRoomId as string,
+    homeserver: (parsed["homeserver"] as string).replace(/\/+$/, ""),
+    userId: parsed["userId"] as string,
+    password: parsed["password"] as string,
+    defaultRoomId: parsed["defaultRoomId"] as string,
   };
 }
 
@@ -61,10 +66,10 @@ export function reauthBackoffMs(consecutiveAuthFailures: number): number {
  * M_LIMIT_EXCEEDED is surfaced with the rounded-up retry-after in seconds.
  */
 export function loginErrorMessage(body: Record<string, unknown>, httpStatus: number): string {
-  const errcode = (body.errcode as string) || "UNKNOWN";
-  const error = (body.error as string) || `HTTP ${httpStatus}`;
+  const errcode = (body["errcode"] as string) || "UNKNOWN";
+  const error = (body["error"] as string) || `HTTP ${httpStatus}`;
   if (errcode === "M_LIMIT_EXCEEDED") {
-    const retryMs = (body.retry_after_ms as number) || 60000;
+    const retryMs = (body["retry_after_ms"] as number) || 60000;
     return `Rate limited — wait ${Math.ceil(retryMs / 1000)}s before retrying`;
   }
   return `Login failed: ${errcode} — ${error}`;
