@@ -120,6 +120,14 @@ export interface BufferedMessage {
   timestamp: number;
   roomId: string;
   msgtype?: string;
+  imageUrl?: string;
+  imageInfo?: {
+    mimetype?: string;
+    size?: number;
+    w?: number;
+    h?: number;
+  };
+  replyToEventId?: string;
 }
 
 /**
@@ -258,4 +266,144 @@ export function isSenderAllowed(
   if (sender === selfUserId) return false;
   if (allowedSenders.size > 0 && !allowedSenders.has(sender)) return false;
   return true;
+}
+
+// ── /messages selection & reply-tagging ────────────────────
+
+/** Resolved context for a message that is a reply — the parent it points at. */
+export interface ReplyContext {
+  event_id: string;
+  sender: string;
+  body: string;
+}
+
+/** Wire shape of a single item in the /messages polling response. */
+export interface MessagesResponseItem {
+  event_id: string;
+  sender: string;
+  body: string;
+  room_id: string;
+  timestamp: number;
+  msgtype?: string;
+  image_url?: string;
+  image_info?: { mimetype?: string; size?: number; w?: number; h?: number };
+  in_reply_to?: ReplyContext;
+  // Transient props used only to carry reply metadata between phases; stripped
+  // (via delete) by applyResolvedReplies before the response is serialized.
+  _replyToEventId?: string;
+  _replyToRoomId?: string;
+}
+
+/** Max messages returned by /messages when polling without a since-token. */
+export const MAX_MESSAGES_RESPONSE = 200;
+
+/**
+ * Flatten all room buffers into one timestamp-ascending list. When there is no
+ * since-token, the result is capped to the newest `maxResponse` messages to
+ * bound response size / CPU. Does not mutate the source buffers.
+ */
+export function collectBufferedMessages(
+  buffers: Map<string, BufferedMessage[]>,
+  hasSince: boolean,
+  maxResponse: number = MAX_MESSAGES_RESPONSE,
+): BufferedMessage[] {
+  const allMessages: BufferedMessage[] = [];
+  for (const [, buffer] of buffers) {
+    for (const msg of buffer) {
+      allMessages.push(msg);
+    }
+  }
+  allMessages.sort((a, b) => a.timestamp - b.timestamp);
+
+  // Cap to prevent CPU exhaustion on large buffers (only when returning all).
+  if (!hasSince && allMessages.length > maxResponse) {
+    allMessages.splice(0, allMessages.length - maxResponse);
+  }
+  return allMessages;
+}
+
+/** Project a buffered message into the wire shape, tagging reply temp-props. */
+export function toResponseItem(msg: BufferedMessage): MessagesResponseItem {
+  return {
+    event_id: msg.eventId,
+    sender: msg.sender,
+    body: msg.body,
+    room_id: msg.roomId,
+    timestamp: msg.timestamp,
+    ...(msg.msgtype && msg.msgtype !== "m.text" ? { msgtype: msg.msgtype } : {}),
+    ...(msg.imageUrl ? { image_url: msg.imageUrl } : {}),
+    ...(msg.imageInfo ? { image_info: msg.imageInfo } : {}),
+    ...(msg.replyToEventId
+      ? { _replyToEventId: msg.replyToEventId, _replyToRoomId: msg.roomId }
+      : {}),
+  };
+}
+
+/**
+ * Select messages after the since-token, applying self-echo + allowlist filters,
+ * projected into wire shape. A null or stale (not-found) since-token returns all
+ * matching messages; a found token returns only those strictly after it.
+ */
+export function selectMessagesSince(
+  allMessages: BufferedMessage[],
+  sinceId: string | null,
+  selfUserId: string,
+  allowedSenders: Set<string>,
+): MessagesResponseItem[] {
+  // Stale token (container restarted or buffer wrapped) — return all.
+  const sinceMissing = sinceId !== null && !allMessages.some((m) => m.eventId === sinceId);
+  let foundSince = sinceId === null || sinceMissing;
+
+  const messages: MessagesResponseItem[] = [];
+  for (const msg of allMessages) {
+    if (!foundSince) {
+      if (msg.eventId === sinceId) foundSince = true;
+      continue;
+    }
+    // Self-echo filter + sender allowlist
+    if (!isSenderAllowed(msg.sender, selfUserId, allowedSenders)) continue;
+    messages.push(toResponseItem(msg));
+  }
+  return messages;
+}
+
+/**
+ * Extract the (roomId, replyToEventId) pairs that need reply-context resolution.
+ * Duplicates are preserved — deduplication is the resolver's responsibility.
+ */
+export function selectReplyTargets(
+  messages: MessagesResponseItem[],
+): Array<{ roomId: string; replyToEventId: string }> {
+  return messages
+    .filter((m): m is MessagesResponseItem & { _replyToEventId: string; _replyToRoomId: string } =>
+      Boolean(m._replyToEventId),
+    )
+    .map((m) => ({ roomId: m._replyToRoomId, replyToEventId: m._replyToEventId }));
+}
+
+/**
+ * Merge resolved reply contexts into the messages in place, then strip the
+ * transient _replyTo* props. Pass `resolved = null` for the no-resolve path:
+ * temp-props are still stripped, but no contexts are attached. A resolver entry
+ * that is null/absent leaves that message without an in_reply_to.
+ */
+export function applyResolvedReplies(
+  messages: MessagesResponseItem[],
+  resolved: Map<string, ReplyContext | null> | null,
+): void {
+  if (resolved) {
+    for (const m of messages) {
+      const rid = m._replyToEventId;
+      if (rid !== undefined) {
+        const ctx = resolved.get(rid);
+        if (ctx) m.in_reply_to = ctx;
+      }
+    }
+  }
+
+  // Always clean up temp properties (regardless of the resolve path).
+  for (const m of messages) {
+    delete m._replyToEventId;
+    delete m._replyToRoomId;
+  }
 }
