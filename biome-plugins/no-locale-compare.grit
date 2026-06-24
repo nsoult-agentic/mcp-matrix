@@ -1,0 +1,26 @@
+// Ban String.prototype.localeCompare in src/ — gate-hardening invariant.
+//
+// localeCompare is locale-dependent: its ordering varies with the host's ICU
+// locale data, so it is NON-DETERMINISTIC across machines for non-ASCII keys.
+// Code that uses it for "deterministic output ordering" (sorting keys, building
+// diff-friendly tables, dedup tiebreaks) silently reorders between hosts.
+//
+// Use a deterministic code-point comparator instead, e.g. the established helper:
+//   function compareCodePoints(a: string, b: string): number {
+//     if (a < b) { return -1; }
+//     return a > b ? 1 : 0;
+//   }
+//
+// If a repo genuinely needs locale-aware collation for human-facing display,
+// scope this plugin to exclude that file rather than weakening the rule.
+//
+// (Biome 2.5 has no `noRestrictedSyntax`; this GritQL plugin is the mechanism.
+// `failures produce code, not rules` — origin: mcp-voice ingestion slice 3.)
+language js
+
+`$obj.localeCompare($args)` where {
+    register_diagnostic(
+        span = $obj,
+        message = "Avoid String.prototype.localeCompare: it is locale-dependent and non-deterministic across hosts for non-ASCII keys. Use a deterministic code-point comparator, e.g. (a, b) => (a < b ? -1 : a > b ? 1 : 0). If locale-aware collation for human-facing display is truly required, scope this plugin to exclude the file rather than weakening the rule."
+    )
+}
