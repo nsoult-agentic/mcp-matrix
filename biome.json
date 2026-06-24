@@ -5,6 +5,7 @@
     "clientKind": "git",
     "useIgnoreFile": true
   },
+  "plugins": ["./biome-plugins/no-locale-compare.grit"],
   "files": {
     "ignoreUnknown": false,
     "includes": ["src/**", "test/**"]
